@@ -14,6 +14,28 @@ import { spawn } from "node:child_process";
 const root = process.cwd();
 const requestedPort = Number(process.argv.find((arg) => /^\d+$/.test(arg)) || 5174);
 const shouldOpen = process.argv.includes("--open");
+const channelArgIndex = process.argv.indexOf("--channel");
+const startupChannel = channelArgIndex >= 0 ? process.argv[channelArgIndex + 1] : "api";
+const viewerProfiles = {
+  api: {
+    name: "api",
+    title: "API Line-Art Fourier Viewer",
+    resultRoot: "results_api",
+    defaultChannel: "API_Line",
+    channels: [{ value: "API_Line", label: "API line art" }]
+  },
+  normal: {
+    name: "normal",
+    title: "Normal XDoG Fourier Viewer",
+    resultRoot: "results_v2",
+    defaultChannel: "XDoG_Guide",
+    channels: [
+      { value: "XDoG_Guide", label: "XDoG guide" },
+      { value: "XDoG_Support", label: "XDoG support" }
+    ]
+  }
+};
+const viewerProfile = viewerProfiles[startupChannel] || viewerProfiles.api;
 const tasks = new Map();
 let nextTaskId = 1;
 const precomputeModes = new Set(["sequential", "simultaneous", "full_svg", "both", "all"]);
@@ -87,6 +109,15 @@ function findToolExe() {
     join(root, "Fourier-api-approach.exe"),
     join(root, "Fourier-api-approach", "x64", "Release", "Fourier-api-approach.exe"),
     join(root, "x64", "Release", "Fourier-api-approach.exe")
+  ];
+  return candidates.find((path) => existsSync(path)) || candidates[0];
+}
+
+function findProjectFourierExe() {
+  const candidates = [
+    join(root, "ProjectFourier.exe"),
+    join(root, "x64", "Release", "ProjectFourier.exe"),
+    join(root, "ProjectFourier", "x64", "Release", "ProjectFourier.exe")
   ];
   return candidates.find((path) => existsSync(path)) || candidates[0];
 }
@@ -204,7 +235,7 @@ function parseMultipartUpload(request, body) {
 }
 
 function listImages() {
-  const dir = normalize(resolve(join(root, "results_api")));
+  const dir = normalize(resolve(join(root, viewerProfile.resultRoot)));
   if (!dir.startsWith(root) || !existsSync(dir)) return [];
   return readdirSync(dir)
     .filter((name) => safeName(name))
@@ -252,6 +283,11 @@ function runTask(label, command, args) {
 }
 
 async function handleApi(request, response, url) {
+  if (url.pathname === "/api/viewer-config") {
+    sendJson(response, viewerProfile);
+    return true;
+  }
+
   if (url.pathname === "/api/images") {
     sendJson(response, { images: listImages() });
     return true;
@@ -260,7 +296,7 @@ async function handleApi(request, response, url) {
   if (url.pathname === "/api/components") {
     const image = safeName(url.searchParams.get("image"));
     const channel = safeName(url.searchParams.get("channel"));
-    const dir = normalize(resolve(join(root, "results_api", image, "comp")));
+    const dir = normalize(resolve(join(root, viewerProfile.resultRoot, image, "comp")));
 
     if (!image || !channel || !dir.startsWith(root) || !existsSync(dir)) {
       sendJson(response, { files: [] });
@@ -305,11 +341,22 @@ async function handleApi(request, response, url) {
         sendJson(response, { error: "Input file does not exist" }, 400);
         return true;
       }
-      const dftConfig = writeSceneConfigOverride(body.params);
-      const args = ["--config", "api_line_config.ini", "--output", "results_api"];
-      if (dftConfig) args.push("--dft-config", dftConfig);
-      args.push(inputPath);
-      const task = runTask(`Extract ${safeStem(input)}`, findToolExe(), args);
+      let command;
+      let args;
+      let label;
+      if (viewerProfile.name === "normal") {
+        command = findProjectFourierExe();
+        args = ["--no-gui", inputPath];
+        label = `Local extract ${safeStem(input)}`;
+      } else {
+        const dftConfig = writeSceneConfigOverride(body.params);
+        command = findToolExe();
+        args = ["--config", "api_line_config.ini", "--output", viewerProfile.resultRoot];
+        if (dftConfig) args.push("--dft-config", dftConfig);
+        args.push(inputPath);
+        label = `API extract ${safeStem(input)}`;
+      }
+      const task = runTask(label, command, args);
       sendJson(response, { taskId: task.id });
     } catch (error) {
       sendJson(response, { error: error.message }, 400);
@@ -322,17 +369,17 @@ async function handleApi(request, response, url) {
       const body = JSON.parse((await collectRequestBody(request, 1024 * 1024)).toString("utf8") || "{}");
       const image = safeName(body.image);
       const mode = safeName(body.mode || "both");
-      const channel = safeName(body.channel || "");
+      const channel = safeName(body.channel || viewerProfile.defaultChannel);
       if (!precomputeModes.has(mode)) {
         sendJson(response, { error: "Unsupported DFT mode" }, 400);
         return true;
       }
-      if (!image || !existsSync(join(root, "results_api", image, "comp"))) {
+      if (!image || !existsSync(join(root, viewerProfile.resultRoot, image, "comp"))) {
         sendJson(response, { error: "Image result folder does not exist" }, 400);
         return true;
       }
       const dftConfig = writeSceneConfigOverride(body.params);
-      const args = ["--precompute-only", "--config", "api_line_config.ini", "--output", "results_api", "--modes", mode];
+      const args = ["--precompute-only", "--config", "api_line_config.ini", "--output", viewerProfile.resultRoot, "--modes", mode];
       if (dftConfig) args.push("--dft-config", dftConfig);
       if (channel) args.push("--channels", channel);
       args.push(image);
@@ -401,6 +448,7 @@ function listen(port, attemptsLeft = 20) {
   server.listen(port, "127.0.0.1", () => {
     const url = `http://127.0.0.1:${port}/dft_viewer.html`;
     console.log(`LLM line-art Fourier viewer: ${url}`);
+    console.log(`Channel profile: ${viewerProfile.name} (${viewerProfile.resultRoot} / ${viewerProfile.defaultChannel})`);
     console.log("Keep this window open while using the viewer.");
     openBrowser(url);
   });

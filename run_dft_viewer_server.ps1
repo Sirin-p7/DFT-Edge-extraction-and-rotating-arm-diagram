@@ -1,5 +1,7 @@
 param(
-    [int]$Port = 5174
+    [int]$Port = 5174,
+    [ValidateSet("api", "normal")]
+    [string]$Channel = "api"
 )
 
 $ErrorActionPreference = "Stop"
@@ -34,6 +36,7 @@ foreach ($potraceDir in $potraceCandidates) {
 
 Write-Host "LLM line-art Fourier viewer"
 Write-Host "Root: $root"
+Write-Host "Channel: $Channel"
 
 $node = Get-Command node -ErrorAction SilentlyContinue
 if (-not $node) {
@@ -50,7 +53,7 @@ Write-Host "The server will choose $Port, or the next free port if $Port is busy
 Write-Host "Keep this window open while using the viewer."
 Write-Host ""
 
-node dft_static_server.mjs $Port --open
+node dft_static_server.mjs $Port --open --channel $Channel
 
 Write-Host ""
 Write-Host "Viewer server stopped."

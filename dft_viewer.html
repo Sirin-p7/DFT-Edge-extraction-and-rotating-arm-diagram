@@ -520,7 +520,7 @@
 
     <main>
       <header>
-        <h1>LLM Line-Art Fourier Viewer</h1>
+        <h1 id="viewerTitle">LLM Line-Art Fourier Viewer</h1>
         <div class="header-actions">
           <div id="status" class="status">Loading</div>
         </div>
@@ -536,6 +536,7 @@
   <script>
     const TAU = Math.PI * 2;
     const els = {
+      viewerTitle: document.getElementById("viewerTitle"),
       image: document.getElementById("imageSelect"),
       channel: document.getElementById("channelSelect"),
       viewMode: document.getElementById("viewModeSelect"),
@@ -620,8 +621,20 @@
       sceneTime: 0,
       sceneOffscreen: null,
       sceneOffscreenKey: "",
+      sceneCompletedCanvas: null,
+      sceneCompletedCanvasKey: "",
+      sceneCompletedCount: 0,
+      componentTrailCanvas: null,
+      componentTrailCanvasKey: "",
       lastSceneFrame: 0,
       seeking: false,
+      viewerProfile: {
+        name: "api",
+        title: "API Line-Art Fourier Viewer",
+        resultRoot: "results_api",
+        defaultChannel: "API_Line",
+        channels: [{ value: "API_Line", label: "API line art" }]
+      },
       viewerConfig: {},
       recordSeconds: 6,
       uploadedInput: "",
@@ -697,11 +710,13 @@
       }
       const index = currentComponentIndex();
       const file = state.componentFiles[index] || `${els.channel.value}_${padIndex(index)}.svg`;
-      return `results_api/${els.image.value}/comp/${file}`;
+      return `${state.viewerProfile.resultRoot}/${els.image.value}/comp/${file}`;
     }
 
     function channelLabel(value) {
       if (value === "API_Line") return "API line art";
+      if (value === "XDoG_Guide") return "XDoG guide";
+      if (value === "XDoG_Support") return "XDoG support";
       return value || "channel";
     }
 
@@ -711,11 +726,11 @@
     }
 
     function backgroundUrl() {
-      return `results_api/${els.image.value}/${els.channel.value}.svg`;
+      return `${state.viewerProfile.resultRoot}/${els.image.value}/${els.channel.value}.svg`;
     }
 
     function dftDataUrl() {
-      return `results_api/${els.image.value}/dft_data/${els.channel.value}_${els.sceneMode.value}.json`;
+      return `${state.viewerProfile.resultRoot}/${els.image.value}/dft_data/${els.channel.value}_${els.sceneMode.value}.json`;
     }
 
     function clamp(value, min, max) {
@@ -873,6 +888,39 @@
     }
 
     async function loadViewerConfig() {
+      try {
+        const response = await fetch("/api/viewer-config", { cache: "no-store" });
+        if (response.ok) {
+          const profile = await response.json();
+          if (profile && profile.resultRoot && profile.defaultChannel) {
+            state.viewerProfile = {
+              name: profile.name || "",
+              title: profile.title || "LLM Line-Art Fourier Viewer",
+              resultRoot: profile.resultRoot,
+              defaultChannel: profile.defaultChannel,
+              channels: Array.isArray(profile.channels) && profile.channels.length > 0
+                ? profile.channels
+                : [{ value: profile.defaultChannel, label: channelLabel(profile.defaultChannel) }]
+            };
+            document.title = state.viewerProfile.title;
+            els.viewerTitle.textContent = state.viewerProfile.title;
+            els.channel.replaceChildren(...state.viewerProfile.channels.map((channel) => {
+              const option = document.createElement("option");
+              option.value = channel.value;
+              option.textContent = channel.label || channelLabel(channel.value);
+              return option;
+            }));
+            els.channel.value = state.viewerProfile.defaultChannel;
+            els.precomputeChannel.replaceChildren(
+              new Option("Configured channel", ""),
+              ...state.viewerProfile.channels.map((channel) => new Option(channel.label || channelLabel(channel.value), channel.value))
+            );
+          }
+        }
+      } catch (err) {
+        state.viewerProfile = state.viewerProfile || {};
+      }
+
       try {
         const response = await fetch("dft_scene_params.txt", { cache: "no-store" });
         if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
@@ -1049,6 +1097,16 @@
 
     function clearSavedComponentTrail() {
       state.componentTrail.clear();
+      state.componentTrailCanvas = null;
+      state.componentTrailCanvasKey = "";
+    }
+
+    function clearSceneRenderCaches() {
+      state.sceneOffscreen = null;
+      state.sceneOffscreenKey = "";
+      state.sceneCompletedCanvas = null;
+      state.sceneCompletedCanvasKey = "";
+      state.sceneCompletedCount = 0;
     }
 
     function captureCurrentComponentTrail() {
@@ -1062,6 +1120,8 @@
         })),
         viewBox: { ...state.viewBox }
       });
+      state.componentTrailCanvas = null;
+      state.componentTrailCanvasKey = "";
     }
 
     function rememberOrClearComponentTrail() {
@@ -1602,7 +1662,7 @@
       const sampledSources = [];
       if (state.componentFiles.length > 0) {
         for (const file of state.componentFiles) {
-          const svg = await fetchOptionalSvgDocument(`results_api/${els.image.value}/comp/${file}`);
+          const svg = await fetchOptionalSvgDocument(`${state.viewerProfile.resultRoot}/${els.image.value}/comp/${file}`);
           if (!svg) continue;
           sampledSources.push(collectSvgLoops(svg));
         }
@@ -1751,6 +1811,7 @@
       const url = dftDataUrl();
       setStatus(`Loading ${url}`);
       clearSavedComponentTrail();
+      clearSceneRenderCaches();
 
       try {
         const response = await fetch(url, { cache: "no-store" });
@@ -1992,12 +2053,27 @@
       context.stroke();
     }
 
+    function drawBrokenPolylineWithTransform(context, points, breaks, transform, color, width, closePath, limit, stride = 1) {
+      if (points.length < 2) return;
+      context.save();
+      context.setTransform(transform.ratio, 0, 0, transform.ratio, 0, 0);
+      drawBrokenPolylineOn(context, points, breaks, transform, color, width, closePath, limit, stride);
+      context.restore();
+    }
+
     function drawImageInViewBox(image, transform, alpha) {
       if (!image || !image.complete || image.naturalWidth === 0) return;
       const topLeft = toScreen({ x: transform.vb.x, y: transform.vb.y }, transform);
       ctx.save();
       ctx.globalAlpha = alpha;
       ctx.drawImage(image, topLeft.x, topLeft.y, transform.vb.width * transform.scale, transform.vb.height * transform.scale);
+      ctx.restore();
+    }
+
+    function drawDeviceCanvas(canvas) {
+      ctx.save();
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.drawImage(canvas, 0, 0);
       ctx.restore();
     }
 
@@ -2048,12 +2124,40 @@
     }
 
     function drawComponentTrail(transform) {
-      for (const [index, component] of state.componentTrail) {
-        if (index === currentComponentIndex()) continue;
-        for (const loop of component.loops) {
-          drawBrokenPolyline(loop.trace, loop.breaks, transform, "rgba(8, 127, 140, 0.34)", 1.75, false);
-        }
+      if (state.componentTrail.size === 0) return;
+      const key = [
+        state.viewerProfile.resultRoot,
+        els.image.value,
+        els.channel.value,
+        els.fixedCenter.checked,
+        els.order.value,
+        els.harmonic.value,
+        transform.cssWidth,
+        transform.cssHeight,
+        transform.ratio,
+        transform.scale,
+        currentComponentIndex(),
+        [...state.componentTrail.keys()].join(",")
+      ].join("/");
+      if (state.componentTrailCanvas && state.componentTrailCanvasKey !== key) {
+        state.componentTrailCanvas = null;
+        state.componentTrailCanvasKey = "";
       }
+      if (!state.componentTrailCanvas) {
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.max(1, Math.floor(transform.cssWidth * transform.ratio));
+        canvas.height = Math.max(1, Math.floor(transform.cssHeight * transform.ratio));
+        const off = canvas.getContext("2d");
+        for (const [index, component] of state.componentTrail) {
+          if (index === currentComponentIndex()) continue;
+          for (const loop of component.loops) {
+            drawBrokenPolylineWithTransform(off, loop.trace, loop.breaks, transform, "rgba(8, 127, 140, 0.34)", 1.75, false);
+          }
+        }
+        state.componentTrailCanvas = canvas;
+        state.componentTrailCanvasKey = key;
+      }
+      drawDeviceCanvas(state.componentTrailCanvas);
     }
 
     function sceneDrawProgress(component, cycleT) {
@@ -2081,15 +2185,14 @@
     function ensureSceneFinalCanvas(transform) {
       const data = state.sceneData;
       if (!data) return null;
-      const key = `${data.image}/${data.channel}/${data.mode}/${els.fixedCenter.checked}/${transform.cssWidth}x${transform.cssHeight}/${transform.scale}`;
+      const key = `${data.image}/${data.channel}/${data.mode}/${els.fixedCenter.checked}/${transform.cssWidth}x${transform.cssHeight}/${transform.ratio}/${transform.scale}/${data.drawStride || 1}`;
       if (state.sceneOffscreen && state.sceneOffscreenKey === key) return state.sceneOffscreen;
 
       const canvas = document.createElement("canvas");
-      canvas.width = Math.max(1, Math.floor(transform.cssWidth));
-      canvas.height = Math.max(1, Math.floor(transform.cssHeight));
+      canvas.width = Math.max(1, Math.floor(transform.cssWidth * transform.ratio));
+      canvas.height = Math.max(1, Math.floor(transform.cssHeight * transform.ratio));
       const off = canvas.getContext("2d");
-      off.fillStyle = "#fbfaf6";
-      off.fillRect(0, 0, canvas.width, canvas.height);
+      off.setTransform(transform.ratio, 0, 0, transform.ratio, 0, 0);
       off.lineJoin = "round";
       off.lineCap = "round";
       off.strokeStyle = "rgba(8, 127, 140, 0.96)";
@@ -2106,6 +2209,56 @@
       state.sceneOffscreen = canvas;
       state.sceneOffscreenKey = key;
       return canvas;
+    }
+
+    function completedSequentialCount(data, cycleT) {
+      if (!data || data.mode !== "sequential") return 0;
+      let count = 0;
+      for (const component of data.components) {
+        if (cycleT >= component.end) ++count;
+        else break;
+      }
+      return count;
+    }
+
+    function ensureSequentialCompletedCanvas(transform, cycleT) {
+      const data = state.sceneData;
+      if (!data || data.mode !== "sequential") return null;
+      const completedCount = completedSequentialCount(data, cycleT);
+      if (completedCount <= 0) return null;
+
+      const key = `${data.image}/${data.channel}/${data.mode}/${els.fixedCenter.checked}/${transform.cssWidth}x${transform.cssHeight}/${transform.ratio}/${transform.scale}/${data.drawStride || 1}`;
+      if (state.sceneCompletedCanvas && state.sceneCompletedCanvasKey !== key) {
+        state.sceneCompletedCanvas = null;
+        state.sceneCompletedCanvasKey = "";
+        state.sceneCompletedCount = 0;
+      }
+      if (state.sceneCompletedCanvas && completedCount < state.sceneCompletedCount) {
+        state.sceneCompletedCanvas = null;
+        state.sceneCompletedCanvasKey = "";
+        state.sceneCompletedCount = 0;
+      }
+      if (!state.sceneCompletedCanvas) {
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.max(1, Math.floor(transform.cssWidth * transform.ratio));
+        canvas.height = Math.max(1, Math.floor(transform.cssHeight * transform.ratio));
+        state.sceneCompletedCanvas = canvas;
+        state.sceneCompletedCanvasKey = key;
+        state.sceneCompletedCount = 0;
+      }
+
+      const off = state.sceneCompletedCanvas.getContext("2d");
+      off.setTransform(transform.ratio, 0, 0, transform.ratio, 0, 0);
+      for (let i = state.sceneCompletedCount; i < completedCount; ++i) {
+        const component = data.components[i];
+        const tracePoints = traceForComponent(component);
+        if (tracePoints.length < 2) continue;
+        drawFilteredTraceOn(off, tracePoints, component.points, component.breaks, transform,
+          "rgba(8, 127, 140, 0.96)", 2, false, tracePoints.length, data.drawStride || 1,
+          traceDeviationLimit(component));
+      }
+      state.sceneCompletedCount = completedCount;
+      return state.sceneCompletedCanvas;
     }
 
     function drawSceneTrace(component, transform, progress) {
@@ -2211,11 +2364,17 @@
 
       if (inHold) {
         const finalCanvas = ensureSceneFinalCanvas(transform);
-        if (finalCanvas) ctx.drawImage(finalCanvas, 0, 0);
+        if (finalCanvas) drawDeviceCanvas(finalCanvas);
         return;
       }
 
-      for (const component of data.components) {
+      const completedCanvas = els.showTrace.checked ? ensureSequentialCompletedCanvas(transform, cycleT) : null;
+      const completedCount = completedCanvas ? state.sceneCompletedCount : 0;
+      if (completedCanvas) drawDeviceCanvas(completedCanvas);
+
+      for (let i = 0; i < data.components.length; ++i) {
+        const component = data.components[i];
+        if (data.mode === "sequential" && i < completedCount) continue;
         const progress = sceneDrawProgress(component, cycleT);
         if (progress > 0 && els.showTrace.checked) {
           drawSceneTrace(component, transform, progress);
@@ -2421,8 +2580,7 @@
       els.sceneMode.addEventListener("change", () => {
         state.t = 0;
         state.sceneTime = 0;
-        state.sceneOffscreen = null;
-        state.sceneOffscreenKey = "";
+        clearSceneRenderCaches();
         updateProgressLabel();
         if (isSceneMode()) {
           loadCurrentScene();
@@ -2494,8 +2652,7 @@
       els.order.addEventListener("change", rebuildTrace);
       els.harmonic.addEventListener("input", rebuildTrace);
       els.fixedCenter.addEventListener("change", () => {
-        state.sceneOffscreen = null;
-        state.sceneOffscreenKey = "";
+        clearSceneRenderCaches();
         if (isSceneMode()) render();
         else {
           rebuildTrace();
@@ -2563,8 +2720,7 @@
       }
 
       window.addEventListener("resize", () => {
-        state.sceneOffscreen = null;
-        state.sceneOffscreenKey = "";
+        clearSceneRenderCaches();
         render();
       });
     }
